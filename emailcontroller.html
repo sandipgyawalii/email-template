@@ -1,0 +1,167 @@
+<?php
+
+namespace App\Http\Controllers\admin;
+
+use App\Http\Controllers\Controller;
+use App\Mail\Emailtask;
+use App\Models\Emailhistory;
+use App\Models\User;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Mail;
+use Illuminate\Validation\ValidationException;
+
+class EmailMarketingController extends Controller
+{
+
+    protected $model;
+    public function __construct(Emailhistory $model)
+    {
+        $this->model = $model;
+    }
+    public function index()
+    {
+        $data['users'] = User::where('id', '!=', Auth::id())->get(['id', 'email']);
+        return view('email.index', compact('data'));
+    }
+
+    public function send(Request $request)
+    {
+        try {
+            $validatedData = $request->validate($this->model->getRules(), $this->model->getMessages());
+            // dd($validatedData);
+            $message = $validatedData['message'];
+            $subject = $validatedData['subject'];
+
+            $emails = [];
+            if (isset($validatedData['user_ids'])) {
+                $emails = User::whereIn('id', $validatedData['user_ids'])->pluck('email')->toArray();
+            }
+
+            if (isset($validatedData['userlistfile'])) {
+                $fileEmails = $this->processUploadedFile($validatedData['userlistfile']);
+                if ($fileEmails != false) {
+                    $emails = array_merge($emails, $fileEmails['valid']);
+                    $invalidEmails = $fileEmails['invalid'];
+                    if (!$emails) {
+                        session()->flash('error', 'Email Column Not found. Make sure Column name is email or Email');
+                    }
+                } else {
+                    session()->flash('error', 'There was error while reading the file. Please check the file permission');
+                }
+            }
+
+            // dd($emails, $invalidEmails);
+            if (isset($validatedData['user_custom_list'])) {
+                $emails = array_merge($emails, $validatedData['user_custom_list']);
+            }
+
+            $batch =  $this->getNextBatchNumber();
+
+            if (empty($emails)) {
+                session()->flash('alert-error', 'No valid Emails found');
+            }
+            if (!empty($emails)) {
+                $this->sendandstoreemail($emails, $subject, $message, true, $batch);
+            }
+
+            if (!empty($invalidEmails)) {
+                $this->sendandstoreemail($invalidEmails, $subject, $message, false, $batch);
+            }
+            session()->flash('success', 'Email sent successfully');
+            return redirect()->route('email.index');
+        } catch (ValidationException $th) {
+            Log::info('Validation error on sending email. Message: ' . $th->getMessage());
+            return redirect()->back()->withErrors($th->errors());
+        } catch (\Throwable $th) {
+            session()->flash('error', 'There was an error on sending email');
+            Log::info('There was an error on sending email. Message: ' . $th->getMessage());
+            return redirect()->route('email.index');
+        }
+    }
+
+    function csvToArray($filename = '', $delimiter = ',')
+    {
+        if (!file_exists($filename) || !is_readable($filename))
+            return false;
+
+        $header = null;
+        $data = array();
+        if (($handle = fopen($filename, 'r')) !== false) {
+            while (($row = fgetcsv($handle, 1000, $delimiter)) !== false) {
+                if (!$header) {
+                    $header = $row;
+                } else {
+                    $data[] = array_combine($header, $row);
+                }
+            }
+            fclose($handle);
+        }
+
+        return $data;
+    }
+
+    function sendemail($email, $message)
+    {
+        try {
+            // dd($message);
+            Mail::to($email)->queue(new Emailtask($message));
+            return true;
+        } catch (\Exception $ex) {
+            Log::info("Exception on sending email. Message" . $ex->getMessage());
+            return false;
+        } catch (\Error $er) {
+            Log::info("Error on sending email. Message" . $er->getMessage());
+            return false;
+        }
+    }
+
+    private function getNextBatchNumber()
+    {
+        $lastEntry = Emailhistory::orderBy('created_at', 'desc')->first();
+        return $lastEntry ? $lastEntry->batch + 1 : 1;
+    }
+
+    private function processUploadedFile($file)
+    {
+        $data = $this->csvToArray($file);
+        if ($data === false) {
+            return false;
+        }
+
+        $validEmails = [];
+        $invalidEmails = [];
+
+        foreach ($data as $row) {
+            $email = $row['email'] ?? $row['Email'] ?? null;
+            if ($email && filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                $validEmails[] = $email;
+            } else {
+                $invalidEmails[] = $email;
+            }
+        }
+
+        return ['valid' => $validEmails, 'invalid' => $invalidEmails];
+    }
+
+    public function sendandstoreemail($emails, $subject, $message, $status, $batch)
+    {
+
+        foreach ($emails as $email) {
+            if ($status == true) {
+                $emailsent = $this->sendemail($email, $subject, $message);
+            }
+            $data['email'] = $email;
+            $data['subject'] = $subject;
+            $data['message'] = $message;
+            if (isset($emailsent)) {
+                $data['status'] = 1;
+            } else {
+                $data['status'] = 0;
+            }
+            $data['batch'] = $batch;
+            Emailhistory::create($data);
+        }
+    }
+}
